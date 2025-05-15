@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+ProductHunt Scraper - Tool to fetch top products launched today from ProductHunt
+"""
+
+import requests
+import json
+import os
+import datetime
+import argparse
+import sys
+import logging
+from typing import Dict, List, Optional, Any
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+class ProductHuntError(Exception):
+    """Base exception for ProductHunt API errors"""
+    pass
+
+
+class ProductHuntScraper:
+    """Client for scraping ProductHunt top products"""
+    
+    BASE_URL = "https://api.producthunt.com/v2/api/graphql"
+    
+    def __init__(self, access_token: Optional[str] = None, logger=None):
+        """Initialize the scraper with an access token"""
+        self.access_token = access_token or os.environ.get("PRODUCTHUNT_TOKEN")
+        if not self.access_token:
+            raise ValueError("Access token must be provided either directly or via PRODUCTHUNT_TOKEN environment variable")
+        
+        self.logger = logger or logging.getLogger(__name__)
+    
+    def _make_request(self, query: str) -> Dict[str, Any]:
+        """Make a GraphQL request to the ProductHunt API"""
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://api.producthunt.com/",
+            "Origin": "https://api.producthunt.com"
+        }
+        
+        # Log the request for debugging
+        self.logger.debug(f"Making request to {self.BASE_URL}")
+        self.logger.debug(f"Headers: {headers}")
+        self.logger.debug(f"Query: {query}")
+        
+        data = {"query": query}
+        
+        try:
+            response = requests.post(self.BASE_URL, headers=headers, json=data)
+            
+            # Log the full response for debugging
+            self.logger.debug(f"Response status: {response.status_code}")
+            try:
+                response_json = response.json()
+                self.logger.debug(f"Response JSON: {json.dumps(response_json, indent=2)}")
+            except:
+                self.logger.debug(f"Response text: {response.text[:500]}")
+            
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Check for GraphQL errors
+            if "errors" in result:
+                error_message = "; ".join([err.get("message", "Unknown error") for err in result["errors"]])
+                self.logger.error(f"GraphQL errors: {json.dumps(result.get('errors', []), indent=2)}")
+                raise ProductHuntError(f"GraphQL error: {error_message}")
+            
+            return result
+        except requests.RequestException as e:
+            self.logger.error(f"API request failed: {str(e)}")
+            raise ProductHuntError(f"API request failed: {str(e)}") from e
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse API response: {str(e)}")
+            raise ProductHuntError(f"Failed to parse API response: {str(e)}") from e
+    
+    def _extract_post_data(self, node: Dict[str, Any], today: datetime.date) -> Optional[Dict[str, Any]]:
+        """Extract post data from a GraphQL node and check if it's from today"""
+        if not node:
+            return None
+            
+        created_at = node.get("createdAt")
+        if not created_at:
+            self.logger.warning(f"Post {node.get('id', 'unknown')} has no creation date")
+            return None
+            
+        try:
+            post_date = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00')).date()
+            if post_date != today:
+                return None
+        except (ValueError, TypeError) as e:
+            self.logger.warning(f"Invalid date format for post {node.get('id', 'unknown')}: {created_at}")
+            return None
+        
+        # Extract topics safely
+        topics = []
+        for topic_edge in node.get("topics", {}).get("edges", []):
+            topic_node = topic_edge.get("node", {})
+            if topic_node and "name" in topic_node:
+                topics.append(topic_node["name"])
+        
+        # Extract makers with updated format
+        makers = []
+        makers_data = node.get("makers", [])
+        if isinstance(makers_data, list):
+            for maker in makers_data:
+                if maker and "name" in maker:
+                    maker_info = {
+                        "name": maker.get("name", ""),
+                        "username": maker.get("username", ""),
+                        "profile_url": f"https://producthunt.com/@{maker.get('username', '')}" if maker.get("username") else ""
+                    }
+                    makers.append(maker_info)
+        
+        return {
+            "id": node.get("id"),
+            "name": node.get("name", "Unnamed Product"),
+            "tagline": node.get("tagline", ""),
+            "description": node.get("description", ""),
+            "url": node.get("url", ""),
+            "votes_count": node.get("votesCount", 0),
+            "comments_count": node.get("commentsCount", 0),
+            "website": node.get("website", ""),
+            "product_url": f"https://producthunt.com/products/{node.get('slug', '')}" if node.get("slug") else "",
+            "created_at": created_at,
+            "thumbnail": node.get("thumbnail", {}).get("url", ""),
+            "topics": topics,
+            "makers": makers
+        }
+    
+    def _create_posts_query(self, limit: int, date_str: str) -> str:
+        """Create a GraphQL query to fetch posts for a specific date"""
+        # Updated query format that works with the API
+        return f"""
+        query {{
+          posts(first: {limit}, postedAfter: "{date_str}T00:00:00Z", postedBefore: "{date_str}T23:59:59Z", order: VOTES) {{
+            edges {{
+              node {{
+                id
+                name
+                tagline
+                description
+                url
+                slug
+                votesCount
+                commentsCount
+                website
+                createdAt
+                thumbnail {{
+                  url
+                }}
+                topics {{
+                  edges {{
+                    node {{
+                      name
+                    }}
+                  }}
+                }}
+                makers {{
+                  id
+                  name
+                  username
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
+    
+    def get_todays_posts(self, limit: Optional[int] = 20, specific_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get today's top posts from ProductHunt
+        
+        Args:
+            limit: Number of posts to return
+            specific_date: Optional date string in YYYY-MM-DD format. If not provided, use today's date
+        """
+        if specific_date:
+            try:
+                target_date = datetime.datetime.strptime(specific_date, "%Y-%m-%d").date()
+            except ValueError:
+                raise ProductHuntError(f"Invalid date format: {specific_date}. Use YYYY-MM-DD format.")
+        else:
+            # Use today's date by default
+            target_date = datetime.datetime.now().date()
+            
+        date_str = target_date.isoformat()
+        self.logger.info(f"Fetching top products for {date_str}")
+        
+        fetch_limit = max(limit * 2, 20)  # Get more results than needed to ensure we have enough after filtering
+        if fetch_limit > 50:  # Set a reasonable upper limit
+            fetch_limit = 50
+        
+        # Fetch posts using date filters in the GraphQL query
+        posts = self._fetch_posts(fetch_limit, target_date, date_str)
+        
+        # Sort by votes count in descending order (highest votes first)
+        posts.sort(key=lambda x: x.get("votes_count", 0), reverse=True)
+        
+        # Limit the results to the requested number
+        return posts[:limit]
+    
+    def _fetch_posts(self, limit: int, target_date: datetime.date, date_str: str) -> List[Dict[str, Any]]:
+        """Fetch posts for a specific date"""
+        query = self._create_posts_query(limit, date_str)
+        result = self._make_request(query)
+        
+        posts = []
+        edges = result.get("data", {}).get("posts", {}).get("edges", [])
+        
+        if not edges:
+            self.logger.warning(f"No posts found in API response for date {date_str}")
+            return []
+        
+        for edge in edges:
+            post_data = self._extract_post_data(edge.get("node", {}), target_date)
+            if post_data:
+                posts.append(post_data)
+        
+        self.logger.info(f"Found {len(posts)} posts for {date_str}")
+        return posts
+
+
+def setup_logging(verbose: bool = False):
+    """Setup logging configuration"""
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stderr
+    )
+    return logging.getLogger("ph_scraper")
+
+
+def main():
+    """Main function to run the scraper"""
+    parser = argparse.ArgumentParser(description="Scrape top products from ProductHunt launched today")
+    parser.add_argument("--token", help="ProductHunt API access token (or set PRODUCTHUNT_TOKEN environment variable)")
+    parser.add_argument("--limit", type=int, default=10, help="Number of products to fetch (default: 10)")
+    parser.add_argument("--format", choices=["json", "text"], default="text", help="Output format (default: text)")
+    parser.add_argument("--output", help="Output file path (if not specified, prints to stdout)")
+    parser.add_argument("--date", help="Specific date to fetch (format: YYYY-MM-DD, default: today)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    
+    args = parser.parse_args()
+    
+    logger = setup_logging(args.verbose)
+    
+    try:
+        scraper = ProductHuntScraper(access_token=args.token, logger=logger)
+        posts = scraper.get_todays_posts(limit=args.limit, specific_date=args.date)
+        
+        if not posts:
+            date_str = args.date or "today"
+            logger.warning(f"No posts found for {date_str}")
+            print(f"No products found for {date_str} on ProductHunt.")
+            return 0
+        
+        if args.format == "json":
+            output = json.dumps(posts, indent=2)
+        else:
+            date_str = args.date or "Today"
+            display_date = date_str if args.date else "Today"
+            output_lines = [f"{display_date}'s Top {len(posts)} Products on ProductHunt:", ""]
+            
+            for i, post in enumerate(posts, 1):
+                output_lines.append(f"{i}. {post['name']} - {post['tagline']}")
+                output_lines.append(f"   Votes: {post['votes_count']} | Comments: {post['comments_count']}")
+                
+                if post['website']:
+                    output_lines.append(f"   Website: {post['website']}")
+                
+                if post['product_url']:
+                    output_lines.append(f"   ProductHunt: {post['product_url']}")
+                
+                if post['makers']:
+                    makers_str = ", ".join([maker['name'] for maker in post['makers']])
+                    output_lines.append(f"   Makers: {makers_str}")
+                
+                if post['topics']:
+                    output_lines.append(f"   Topics: {', '.join(post['topics'])}")
+                
+                output_lines.append("")
+            
+            output = "\n".join(output_lines)
+        
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output)
+            logger.info(f"Results saved to {args.output}")
+            print(f"Results saved to {args.output}")
+        else:
+            print(output)
+            
+    except ProductHuntError as e:
+        logger.error(f"ProductHunt API error: {str(e)}")
+        print(f"Error: {str(e)}")
+        return 1
+    except Exception as e:
+        logger.exception("Unexpected error")
+        print(f"Error: {str(e)}")
+        return 1
+    
+    return 0
+
+
+def get_top_products(limit: int = 10, date: Optional[datetime.date] = None) -> List[Dict[str, Any]]:
+    """
+    Wrapper function to get top products from ProductHunt.
+    This function exists to provide compatibility with the daily_update.py script.
+    
+    Args:
+        limit: Number of products to return
+        date: Optional date to fetch products for. If None, uses today's date.
+    
+    Returns:
+        List of product dictionaries with standardized format for Supabase
+    """
+    logger = setup_logging()
+    
+    try:
+        # Get access token from environment
+        access_token = os.environ.get("PRODUCTHUNT_TOKEN")
+        if not access_token:
+            logger.error("PRODUCTHUNT_TOKEN environment variable not set")
+            return []
+            
+        # Initialize scraper
+        scraper = ProductHuntScraper(access_token=access_token, logger=logger)
+        
+        # Convert date to string format if provided
+        date_str = date.isoformat() if date else None
+        
+        # Get posts from ProductHunt
+        raw_products = scraper.get_todays_posts(limit=limit, specific_date=date_str)
+        
+        # Transform to format expected by Supabase
+        products = []
+        for product in raw_products:
+            # Get maker IDs
+            maker_ids = [maker.get("username", "") for maker in product.get("makers", [])]
+            
+            # Extract topics as a list of strings
+            topics = product.get("topics", [])
+            
+            # Create standardized product entry
+            supabase_product = {
+                "id": product.get("id"),
+                "name": product.get("name"),
+                "tagline": product.get("tagline"),
+                "description": product.get("description", ""),
+                "url": product.get("product_url", ""),
+                "website_url": product.get("website", ""),
+                "thumbnail_url": product.get("thumbnail", ""),
+                "launch_date": date.isoformat() if date else datetime.datetime.now().date().isoformat(),
+                "upvotes": product.get("votes_count", 0),
+                "maker_ids": maker_ids,
+                "topics": topics
+            }
+            products.append(supabase_product)
+            
+        return products
+        
+    except Exception as e:
+        logger.exception(f"Error fetching top products: {str(e)}")
+        return []
+
+
+if __name__ == "__main__":
+    exit(main()) 
