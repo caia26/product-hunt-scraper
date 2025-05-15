@@ -1,6 +1,6 @@
-# ProductHunt Scraper
+# ProductHunt Scraper with Supabase Integration
 
-A tool to fetch and display the top products launched on ProductHunt using their GraphQL API. The scraper retrieves products sorted by votes and provides detailed information about each product.
+A tool to fetch and display the top products launched on ProductHunt using their GraphQL API, with integration to store data in Supabase. The scraper retrieves products sorted by votes, provides detailed information about each product, and allows for storing this data in a Supabase database for further analysis.
 
 ## Features
 
@@ -10,11 +10,15 @@ A tool to fetch and display the top products launched on ProductHunt using their
 - Show makers information
 - Export results in text or JSON format
 - Save results to a file
+- **Store product data in Supabase database**
+- **Automatic daily updates**
 
 ## Requirements
 
 - Python 3.6+
 - `requests` library
+- `python-dotenv` library
+- `supabase` library
 
 ## Installation
 
@@ -24,9 +28,9 @@ A tool to fetch and display the top products launched on ProductHunt using their
    pip install -r requirements.txt
    ```
 
-## Usage
+## Configuration
 
-### Authentication
+### ProductHunt API
 
 You'll need a ProductHunt API access token. You can:
 - Pass it directly using the `--token` argument
@@ -41,24 +45,70 @@ To get a token, you need to:
 2. Register an application at https://api.producthunt.com/v2/oauth/applications
 3. Get your developer token from the API dashboard
 
-### Basic Usage
+### Supabase Configuration
+
+To enable Supabase integration, you need to set up:
+1. Create a Supabase account at https://supabase.com/
+2. Create a new project
+3. Add the following environment variables to your `.env` file:
+   ```
+   SUPABASE_URL=your_supabase_url
+   SUPABASE_KEY=your_supabase_api_key
+   ```
+4. Create a `products` table in your Supabase project with the following schema:
+
+```sql
+create table products (
+  id text primary key,
+  name text not null,
+  tagline text,
+  description text,
+  url text,
+  website_url text,
+  thumbnail_url text,
+  launch_date date,
+  upvotes integer,
+  maker_ids jsonb,
+  topics jsonb,
+  created_at timestamp with time zone default now(),
+  updated_at timestamp with time zone
+);
+
+-- Optional index for faster retrieval by date
+create index idx_products_launch_date on products(launch_date);
+```
+
+## Usage
+
+### Basic Usage (Command Line)
 
 ```bash
 # Display today's top 10 products
-python ph_scraper.py --token YOUR_TOKEN
+python scraper.py --token YOUR_TOKEN
 
 # Get the top 20 products in JSON format
-python ph_scraper.py --token YOUR_TOKEN --limit 20 --format json
+python scraper.py --token YOUR_TOKEN --limit 20 --format json
 
 # Fetch products for a specific date
-python ph_scraper.py --token YOUR_TOKEN --date 2023-01-15
+python scraper.py --token YOUR_TOKEN --date 2023-01-15
 
 # Save results to a file
-python ph_scraper.py --token YOUR_TOKEN --output results.txt
+python scraper.py --token YOUR_TOKEN --output results.txt
 
 # Enable verbose logging
-python ph_scraper.py --token YOUR_TOKEN --verbose
+python scraper.py --token YOUR_TOKEN --verbose
 ```
+
+### Daily Updates with Supabase Integration
+
+To update your Supabase database with the latest products:
+
+```bash
+# Run the daily update script
+python daily_update.py
+```
+
+You can automate this script with a cron job or a scheduler to run daily.
 
 ### Command Line Options
 
@@ -88,6 +138,13 @@ Today's Top 5 Products on ProductHunt:
    Makers: Bob Johnson
    Topics: Developer Tools, Utilities
 ```
+
+## Supabase Integration Features
+
+- **Automatic Deduplication**: The system checks if a product already exists before inserting it
+- **Daily Updates**: Can be scheduled to run daily to keep your database updated
+- **Data Querying**: Retrieve products by date or get the top products by upvotes
+- **Error Handling**: Robust error handling for API and database operations
 
 ## Attribution
 
