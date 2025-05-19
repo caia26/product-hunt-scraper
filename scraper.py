@@ -10,8 +10,10 @@ import datetime
 import argparse
 import sys
 import logging
+import time
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qs, urlunparse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,6 +36,94 @@ class ProductHuntScraper:
             raise ValueError("Access token must be provided either directly or via PRODUCTHUNT_TOKEN environment variable")
         
         self.logger = logger or logging.getLogger(__name__)
+    
+    def _clean_url(self, url: str) -> str:
+        """Clean URL by removing tracking parameters"""
+        if not url:
+            return ""
+            
+        try:
+            # Parse the URL
+            parsed = urlparse(url)
+            
+            # Parse query parameters
+            query_params = parse_qs(parsed.query)
+            
+            # Remove common tracking parameters
+            tracking_params = ['ref', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content']
+            for param in tracking_params:
+                query_params.pop(param, None)
+            
+            # Reconstruct the URL without tracking parameters
+            cleaned_query = '&'.join(f"{k}={v[0]}" for k, v in query_params.items())
+            cleaned_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                cleaned_query if cleaned_query else '',
+                parsed.fragment
+            ))
+            
+            return cleaned_url
+        except Exception as e:
+            self.logger.warning(f"Failed to clean URL {url}: {str(e)}")
+            return url
+    
+    def _get_final_url(self, url: str, max_redirects: int = 5) -> str:
+        """
+        Follow redirects to get the final URL
+        """
+        if not url:
+            return ""
+            
+        try:
+            # Add headers to mimic a browser
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            # Start with the initial URL
+            current_url = url
+            redirect_count = 0
+            
+            while redirect_count < max_redirects:
+                # Make the request
+                response = requests.get(current_url, headers=headers, allow_redirects=False)
+                
+                # If we get a redirect
+                if response.status_code in (301, 302, 303, 307, 308):
+                    # Get the new URL
+                    new_url = response.headers.get('Location')
+                    if not new_url:
+                        break
+                        
+                    # Handle relative URLs
+                    if not new_url.startswith(('http://', 'https://')):
+                        parsed = urlparse(current_url)
+                        new_url = f"{parsed.scheme}://{parsed.netloc}{new_url}"
+                    
+                    current_url = new_url
+                    redirect_count += 1
+                    
+                    # Add a small delay to be nice to the server
+                    time.sleep(0.5)
+                else:
+                    break
+            
+            # Clean the final URL
+            final_url = self._clean_url(current_url)
+            self.logger.info(f"Original URL: {url}")
+            self.logger.info(f"Final URL: {final_url}")
+            return final_url
+            
+        except Exception as e:
+            self.logger.error(f"Error getting final URL for {url}: {str(e)}")
+            return url
     
     def _make_request(self, query: str) -> Dict[str, Any]:
         """Make a GraphQL request to the ProductHunt API"""
@@ -83,22 +173,9 @@ class ProductHuntScraper:
             self.logger.error(f"Failed to parse API response: {str(e)}")
             raise ProductHuntError(f"Failed to parse API response: {str(e)}") from e
     
-    def _extract_post_data(self, node: Dict[str, Any], today: datetime.date) -> Optional[Dict[str, Any]]:
-        """Extract post data from a GraphQL node and check if it's from today"""
+    def _extract_post_data(self, node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract post data from a GraphQL node"""
         if not node:
-            return None
-            
-        created_at = node.get("createdAt")
-        if not created_at:
-            self.logger.warning(f"Post {node.get('id', 'unknown')} has no creation date")
-            return None
-            
-        try:
-            post_date = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00')).date()
-            if post_date != today:
-                return None
-        except (ValueError, TypeError) as e:
-            self.logger.warning(f"Invalid date format for post {node.get('id', 'unknown')}: {created_at}")
             return None
         
         # Extract topics safely
@@ -121,28 +198,38 @@ class ProductHuntScraper:
                     }
                     makers.append(maker_info)
         
+        # Get the final company URLs by following redirects
+        website_url = self._get_final_url(node.get("website", ""))
+        product_url = self._get_final_url(node.get("url", ""))
+        
         return {
             "id": node.get("id"),
             "name": node.get("name", "Unnamed Product"),
             "tagline": node.get("tagline", ""),
             "description": node.get("description", ""),
-            "url": node.get("url", ""),
+            "url": product_url,
             "votes_count": node.get("votesCount", 0),
             "comments_count": node.get("commentsCount", 0),
-            "website": node.get("website", ""),
+            "website": website_url,
             "product_url": f"https://producthunt.com/products/{node.get('slug', '')}" if node.get("slug") else "",
-            "created_at": created_at,
+            "created_at": node.get("createdAt", ""),
             "thumbnail": node.get("thumbnail", {}).get("url", ""),
             "topics": topics,
             "makers": makers
         }
     
-    def _create_posts_query(self, limit: int, date_str: str) -> str:
-        """Create a GraphQL query to fetch posts for a specific date"""
-        # Updated query format that works with the API
+    def _create_weekly_query(self, year: int, week: int) -> str:
+        """Create a GraphQL query to fetch posts for a specific week"""
+        # Calculate the start and end dates for the week
+        start_date = datetime.datetime.strptime(f"{year}-W{week:02d}-1", "%Y-W%W-%w")
+        end_date = start_date + datetime.timedelta(days=6)
+        
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        
         return f"""
         query {{
-          posts(first: {limit}, postedAfter: "{date_str}T00:00:00Z", postedBefore: "{date_str}T23:59:59Z", order: VOTES) {{
+          posts(first: 50, postedAfter: "{start_str}T00:00:00Z", postedBefore: "{end_str}T23:59:59Z", order: VOTES) {{
             edges {{
               node {{
                 id
@@ -176,58 +263,41 @@ class ProductHuntScraper:
         }}
         """
     
-    def get_todays_posts(self, limit: Optional[int] = 20, specific_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_weekly_posts(self, year: int, week: int, limit: Optional[int] = 20) -> List[Dict[str, Any]]:
         """
-        Get today's top posts from ProductHunt
+        Get top posts from ProductHunt for a specific week
         
         Args:
+            year: Year to fetch (e.g., 2025)
+            week: Week number (1-52)
             limit: Number of posts to return
-            specific_date: Optional date string in YYYY-MM-DD format. If not provided, use today's date
         """
-        if specific_date:
-            try:
-                target_date = datetime.datetime.strptime(specific_date, "%Y-%m-%d").date()
-            except ValueError:
-                raise ProductHuntError(f"Invalid date format: {specific_date}. Use YYYY-MM-DD format.")
-        else:
-            # Use today's date by default
-            target_date = datetime.datetime.now().date()
+        if not 1 <= week <= 52:
+            raise ProductHuntError(f"Invalid week number: {week}. Week must be between 1 and 52.")
             
-        date_str = target_date.isoformat()
-        self.logger.info(f"Fetching top products for {date_str}")
+        self.logger.info(f"Fetching top products for week {week} of {year}")
         
-        fetch_limit = max(limit * 2, 20)  # Get more results than needed to ensure we have enough after filtering
-        if fetch_limit > 50:  # Set a reasonable upper limit
-            fetch_limit = 50
-        
-        # Fetch posts using date filters in the GraphQL query
-        posts = self._fetch_posts(fetch_limit, target_date, date_str)
-        
-        # Sort by votes count in descending order (highest votes first)
-        posts.sort(key=lambda x: x.get("votes_count", 0), reverse=True)
-        
-        # Limit the results to the requested number
-        return posts[:limit]
-    
-    def _fetch_posts(self, limit: int, target_date: datetime.date, date_str: str) -> List[Dict[str, Any]]:
-        """Fetch posts for a specific date"""
-        query = self._create_posts_query(limit, date_str)
+        # Create and execute the query
+        query = self._create_weekly_query(year, week)
         result = self._make_request(query)
         
         posts = []
         edges = result.get("data", {}).get("posts", {}).get("edges", [])
         
         if not edges:
-            self.logger.warning(f"No posts found in API response for date {date_str}")
+            self.logger.warning(f"No posts found in API response for week {week} of {year}")
             return []
         
         for edge in edges:
-            post_data = self._extract_post_data(edge.get("node", {}), target_date)
+            post_data = self._extract_post_data(edge.get("node", {}))
             if post_data:
                 posts.append(post_data)
         
-        self.logger.info(f"Found {len(posts)} posts for {date_str}")
-        return posts
+        # Sort by votes count in descending order (highest votes first)
+        posts.sort(key=lambda x: x.get("votes_count", 0), reverse=True)
+        
+        # Limit the results to the requested number
+        return posts[:limit]
 
 
 def setup_logging(verbose: bool = False):
@@ -243,12 +313,13 @@ def setup_logging(verbose: bool = False):
 
 def main():
     """Main function to run the scraper"""
-    parser = argparse.ArgumentParser(description="Scrape top products from ProductHunt launched today")
+    parser = argparse.ArgumentParser(description="Scrape top products from ProductHunt")
     parser.add_argument("--token", help="ProductHunt API access token (or set PRODUCTHUNT_TOKEN environment variable)")
-    parser.add_argument("--limit", type=int, default=10, help="Number of products to fetch (default: 10)")
+    parser.add_argument("--limit", type=int, default=20, help="Number of products to fetch (default: 20)")
     parser.add_argument("--format", choices=["json", "text"], default="text", help="Output format (default: text)")
     parser.add_argument("--output", help="Output file path (if not specified, prints to stdout)")
-    parser.add_argument("--date", help="Specific date to fetch (format: YYYY-MM-DD, default: today)")
+    parser.add_argument("--year", type=int, help="Year to fetch (default: current year)")
+    parser.add_argument("--week", type=int, help="Week number to fetch (1-52, default: current week)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -256,21 +327,23 @@ def main():
     logger = setup_logging(args.verbose)
     
     try:
+        # Get current year and week if not specified
+        now = datetime.datetime.now()
+        year = args.year or now.year
+        week = args.week or now.isocalendar()[1]
+        
         scraper = ProductHuntScraper(access_token=args.token, logger=logger)
-        posts = scraper.get_todays_posts(limit=args.limit, specific_date=args.date)
+        posts = scraper.get_weekly_posts(year=year, week=week, limit=args.limit)
         
         if not posts:
-            date_str = args.date or "today"
-            logger.warning(f"No posts found for {date_str}")
-            print(f"No products found for {date_str} on ProductHunt.")
+            logger.warning(f"No posts found for week {week} of {year}")
+            print(f"No products found for week {week} of {year} on ProductHunt.")
             return 0
         
         if args.format == "json":
             output = json.dumps(posts, indent=2)
         else:
-            date_str = args.date or "Today"
-            display_date = date_str if args.date else "Today"
-            output_lines = [f"{display_date}'s Top {len(posts)} Products on ProductHunt:", ""]
+            output_lines = [f"Week {week} of {year}'s Top {len(posts)} Products on ProductHunt:", ""]
             
             for i, post in enumerate(posts, 1):
                 output_lines.append(f"{i}. {post['name']} - {post['tagline']}")
@@ -313,7 +386,7 @@ def main():
     return 0
 
 
-def get_top_products(limit: int = 10, date: Optional[datetime.date] = None) -> List[Dict[str, Any]]:
+def get_top_products(limit: int = 10, date: Optional[datetime.date] = None, year: Optional[int] = None, week: Optional[int] = None) -> List[Dict[str, Any]]:
     """
     Wrapper function to get top products from ProductHunt.
     This function exists to provide compatibility with the daily_update.py script.
@@ -321,6 +394,8 @@ def get_top_products(limit: int = 10, date: Optional[datetime.date] = None) -> L
     Args:
         limit: Number of products to return
         date: Optional date to fetch products for. If None, uses today's date.
+        year: Optional year for weekly pull.
+        week: Optional week number for weekly pull.
     
     Returns:
         List of product dictionaries with standardized format for Supabase
@@ -333,15 +408,17 @@ def get_top_products(limit: int = 10, date: Optional[datetime.date] = None) -> L
         if not access_token:
             logger.error("PRODUCTHUNT_TOKEN environment variable not set")
             return []
-            
-        # Initialize scraper
-        scraper = ProductHuntScraper(access_token=access_token, logger=logger)
         
-        # Convert date to string format if provided
-        date_str = date.isoformat() if date else None
-        
-        # Get posts from ProductHunt
-        raw_products = scraper.get_todays_posts(limit=limit, specific_date=date_str)
+        # Use weekly pull if year and week are provided
+        if year is not None and week is not None:
+            scraper = ProductHuntScraper(access_token=access_token, logger=logger)
+            raw_products = scraper.get_weekly_posts(year=year, week=week, limit=limit)
+        else:
+            # Fallback to daily pull (not used in your workflow now)
+            now = datetime.datetime.now()
+            date_str = date.isoformat() if date else now.date().isoformat()
+            scraper = ProductHuntScraper(access_token=access_token, logger=logger)
+            raw_products = scraper.get_todays_posts(limit=limit, specific_date=date_str)
         
         # Transform to format expected by Supabase
         products = []
@@ -361,15 +438,13 @@ def get_top_products(limit: int = 10, date: Optional[datetime.date] = None) -> L
                 "url": product.get("product_url", ""),
                 "website_url": product.get("website", ""),
                 "thumbnail_url": product.get("thumbnail", ""),
-                "launch_date": date.isoformat() if date else datetime.datetime.now().date().isoformat(),
+                "launch_date": product.get("created_at", ""),
                 "upvotes": product.get("votes_count", 0),
                 "maker_ids": maker_ids,
                 "topics": topics
             }
             products.append(supabase_product)
-            
         return products
-        
     except Exception as e:
         logger.exception(f"Error fetching top products: {str(e)}")
         return []

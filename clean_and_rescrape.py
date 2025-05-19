@@ -3,6 +3,7 @@ import sys
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
+from supabase import create_client
 from scraper import get_top_products
 from supabase_operations import save_product
 
@@ -20,8 +21,28 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-def update_database():
-    """Update the database with today's top products"""
+def clean_database():
+    """Clean the database by removing all existing products"""
+    try:
+        # Initialize Supabase client
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        
+        if not supabase_url or not supabase_key:
+            raise ValueError("Missing Supabase credentials")
+            
+        supabase = create_client(supabase_url, supabase_key)
+        
+        # Delete all products
+        response = supabase.table('products').delete().neq('id', '0').execute()
+        logger.info("Successfully cleaned database")
+        
+    except Exception as e:
+        logger.error(f"Error cleaning database: {str(e)}")
+        raise
+
+def rescrape_data():
+    """Re-scrape data for week 20 of 2025"""
     try:
         # Use week 20 of 2025
         year = 2025
@@ -30,7 +51,7 @@ def update_database():
         logger.info(f"Fetching products for week {week} of {year}")
         
         # Get top products
-        products = get_top_products(limit=20, year=year, week=week)  # Specify week and year for weekly pull
+        products = get_top_products(limit=20, year=year, week=week)
         
         if not products:
             logger.warning("No products found")
@@ -63,7 +84,12 @@ if __name__ == "__main__":
         sys.exit(1)
     
     try:
-        update_database()
+        # First clean the database
+        clean_database()
+        
+        # Then re-scrape the data
+        rescrape_data()
+        
     except Exception as e:
-        logger.error(f"Failed to update database: {str(e)}")
-        sys.exit(1)
+        logger.error(f"Failed to clean and re-scrape: {str(e)}")
+        sys.exit(1) 
