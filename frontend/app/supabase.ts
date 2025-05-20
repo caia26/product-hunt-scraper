@@ -80,4 +80,20 @@ export async function searchProducts(query: string): Promise<Product[]> {
   }
   
   return data || [];
+}
+
+export async function getProductsByDateRange(startDate: string, endDate: string): Promise<Product[]> {
+  const { data, error } = await supabase
+    .from('products')
+    .select('*')
+    .gte('launch_date', startDate)
+    .lte('launch_date', endDate)
+    .order('upvotes', { ascending: false });
+  
+  if (error) {
+    console.error('Error fetching products by date range:', error);
+    return [];
+  }
+  
+  return data || [];
 } 

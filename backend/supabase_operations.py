@@ -31,20 +31,15 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.error(f"Failed to initialize Supabase client: {str(e)}")
 
 def save_product(product):
-    """Save a product to Supabase"""
+    """Upsert a product to Supabase"""
     if not supabase:
         logger.error("Cannot save product: Supabase client not initialized. Please check your credentials.")
         return
     
     try:
-        # Check if product exists
-        response = supabase.table('products').select('id').eq('id', product['id']).execute()
-        
-        # Current timestamp
         now = datetime.now().isoformat()
-        
-        # Prepare data
         product_data = {
+            "id": product['id'],
             "name": product['name'],
             "tagline": product.get('tagline'),
             "description": product.get('description'),
@@ -57,19 +52,11 @@ def save_product(product):
             "topics": product.get('topics', []),
             "updated_at": now
         }
-        
-        if response.data and len(response.data) > 0:
-            # Update existing product
-            supabase.table('products').update(product_data).eq('id', product['id']).execute()
-            logger.info(f"Updated product: {product['name']}")
-        else:
-            # Insert new product
-            product_data["id"] = product['id']
-            product_data["created_at"] = now
-            supabase.table('products').insert(product_data).execute()
-            logger.info(f"Inserted new product: {product['name']}")
+        # Upsert product (insert or update by id)
+        supabase.table('products').upsert(product_data, on_conflict=['id']).execute()
+        logger.info(f"Upserted product: {product['name']}")
     except Exception as e:
-        logger.error(f"Error saving product {product.get('name', 'unknown')}: {str(e)}")
+        logger.error(f"Error upserting product {product.get('name', 'unknown')}: {str(e)}")
 
 def get_products_by_date(date_str):
     """Get products launched on a specific date"""
@@ -83,7 +70,6 @@ def get_products_by_date(date_str):
                           .eq('launch_date', date_str) \
                           .order('upvotes', desc=True) \
                           .execute()
-        
         return response.data
     except Exception as e:
         logger.error(f"Error fetching products by date {date_str}: {str(e)}")
@@ -101,7 +87,6 @@ def get_top_products(limit=10):
                           .order('upvotes', desc=True) \
                           .limit(limit) \
                           .execute()
-        
         return response.data
     except Exception as e:
         logger.error(f"Error fetching top products: {str(e)}")
